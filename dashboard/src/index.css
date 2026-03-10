@@ -1,0 +1,17 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Source Sans 3', Georgia, 'Times New Roman', serif;
+  background-color: #FAFAF8;
+  color: #1a1a1a;
+  font-size: 18px;
+  line-height: 1.6;
+}
+
+#root {
+  min-height: 100vh;
+}

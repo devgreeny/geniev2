@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  # AgentField Control Plane
+  # NOTE: Requires agentfield image. Either:
+  # 1. Build from source: git clone agentfield repo to ../agentfield
+  # 2. Use pre-built image: replace with 'image: agentfield/control-plane:latest'
+  agentfield:
+    image: agentfield/control-plane:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - AGENTFIELD_MODE=local
+      - AGENTFIELD_PORT=8080
+      - GIN_MODE=debug
+    volumes:
+      - agentfield_data:/data
+
+  # SMS Gateway
+  gateway:
+    build:
+      context: ./gateway
+    ports:
+      - "3000:3000"
+    environment:
+      - AGENTFIELD_URL=http://agentfield:8080
+      - VONAGE_API_KEY=${VONAGE_API_KEY}
+      - VONAGE_API_SECRET=${VONAGE_API_SECRET}
+      - DATABASE_PATH=/data/genie.db
+    volumes:
+      - genie_data:/data
+    depends_on:
+      - agentfield
+
+  # Master Agent
+  master-agent:
+    build:
+      context: ./agents
+      dockerfile: master/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - AGENTFIELD_URL=http://agentfield:8080
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DATABASE_PATH=/data/genie.db
+    volumes:
+      - genie_data:/data
+    depends_on:
+      - agentfield
+
+  # Customer Service Agent
+  customer-service-agent:
+    build:
+      context: ./agents
+      dockerfile: customer_service/Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      - AGENTFIELD_URL=http://agentfield:8080
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DATABASE_PATH=/data/genie.db
+    volumes:
+      - genie_data:/data
+    depends_on:
+      - agentfield
+
+volumes:
+  agentfield_data:
+  genie_data:
