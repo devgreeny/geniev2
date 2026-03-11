@@ -2,26 +2,29 @@
 node_modules/
 __pycache__/
 *.pyc
+.venv/
+venv/
+
+# Environment
 .env
+.env.local
 
 # Database
 *.db
 *.db-shm
 *.db-wal
 
-# Customer memory files (contain PII)
-customer_memory/*
-!customer_memory/.gitkeep
-
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# OS
 .DS_Store
-Thumbs.db
+
+# Build
+dist/
+build/
 
 # Logs
 *.log
+npm-debug.log*

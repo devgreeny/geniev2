@@ -83,9 +83,6 @@ class Customer:
     total_visits: int
     notes: Optional[str]
     opted_out: bool
-    segment: Optional[str]  # 'vip', 'at_risk', 'new', 'regular' - auto-calculated or manual override
-    lifetime_value: float  # Total revenue from this customer
-    avg_visit_interval: Optional[int]  # Average days between visits
     created_at: str
     updated_at: str
 
