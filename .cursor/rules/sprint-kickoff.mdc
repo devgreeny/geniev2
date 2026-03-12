@@ -1,0 +1,165 @@
+---
+alwaysApply: true
+---
+
+# geniev2 Sprint Kickoff
+
+Team — this is the first coordinated build session for geniev2.
+
+## North Star (why this sprint exists)
+
+Ship a pilot-ready SMS assistant for one small business using Vonage toll-free as primary channel.
+
+By the end of this session/sprint, the business should be able to:
+
+1. Text with customers reliably
+2. Book/reschedule/cancel appointments via SMS
+3. Run basic retention automations (no-show + win-back)
+4. Approve sensitive outbound texts before they send
+5. View daily ops + conversion metrics in dashboard
+
+---
+
+## First session objective (today)
+
+Each agent should produce a working vertical slice in their area with:
+
+- code committed
+- clear test steps
+- no breakage of existing Telegram flow
+- one short status note: what works, what's left, blockers
+
+**No gold-plating. Pilot reliability > perfect architecture.**
+
+---
+
+## Agent 1 — Vonage SMS Transport
+
+**Goal this session:** inbound + outbound Vonage SMS working with persistence and delivery status.
+
+**Paths:**
+- [gateway/src/routes/vonage.ts](mdc:gateway/src/routes/vonage.ts)
+- [gateway/src/services/vonage.ts](mdc:gateway/src/services/vonage.ts)
+- [gateway/src/index.ts](mdc:gateway/src/index.ts)
+- [gateway/schema.sql](mdc:gateway/schema.sql)
+- [gateway/src/services/db.ts](mdc:gateway/src/services/db.ts)
+
+**Deliver today:**
+- Webhook endpoint (inbound) + signature check
+- Outbound send function
+- Delivery callback handling
+- Idempotency guard (no duplicate message writes)
+
+**Done when:**
+- You can send an SMS in, get an AI response out, and see statuses in DB/logs.
+
+---
+
+## Agent 2 — Scheduling Reliability
+
+**Goal this session:** booking flows become deterministic and safe.
+
+**Paths:**
+- [agents/scheduling/main.py](mdc:agents/scheduling/main.py)
+- [agents/shared/db.py](mdc:agents/shared/db.py)
+- [agents/shared/types.py](mdc:agents/shared/types.py)
+
+**Deliver today:**
+- Stronger intent parsing for book/reschedule/cancel/check
+- Conflict detection + alternate slot suggestion
+- Confirmation gates for cancel/reschedule
+- Structured action output (action, status, next_prompt)
+
+**Done when:**
+- No double-booking and ambiguous time requests are handled gracefully.
+
+---
+
+## Agent 3 — Owner Control + Approvals
+
+**Goal this session:** owner can control AI behavior and approve risky sends.
+
+**Paths:**
+- [agents/master/main.py](mdc:agents/master/main.py)
+- [gateway/src/routes/telegram.ts](mdc:gateway/src/routes/telegram.ts)
+- [gateway/src/routes/dashboard.ts](mdc:gateway/src/routes/dashboard.ts)
+- [gateway/src/services/db.ts](mdc:gateway/src/services/db.ts)
+- [gateway/schema.sql](mdc:gateway/schema.sql)
+
+**Deliver today:**
+- Owner commands: `summary today`, `pause ai`, `resume ai`, `approve <id>`
+- Approval queue schema + API
+- Rule: sensitive outbound waits for approval
+
+**Done when:**
+- Owner can pause/resume and approve queued messages from text command.
+
+---
+
+## Agent 4 — Retention Engine v1
+
+**Goal this session:** simplify to 3 campaigns and make them executable.
+
+**Paths:**
+- [agents/leads/main.py](mdc:agents/leads/main.py)
+- [agents/intelligence/main.py](mdc:agents/intelligence/main.py)
+- [agents/shared/db.py](mdc:agents/shared/db.py)
+- scripts/
+
+**Deliver today:**
+- Implement only:
+  1. no-show rescue
+  2. 30/60 day win-back
+  3. post-visit rebook nudge
+- Stop conditions: replied/booked/opt-out
+- Campaign run logging
+
+**Done when:**
+- At least one campaign can run end-to-end and logs are inspectable.
+
+---
+
+## Agent 5 — Dashboard + Metrics
+
+**Goal this session:** owner has a usable "today view."
+
+**Paths:**
+- [dashboard/src/App.tsx](mdc:dashboard/src/App.tsx)
+- [dashboard/src/App.css](mdc:dashboard/src/App.css)
+- [gateway/src/routes/dashboard.ts](mdc:gateway/src/routes/dashboard.ts)
+- [gateway/src/services/db.ts](mdc:gateway/src/services/db.ts)
+- [README.md](mdc:README.md)
+- [run-local.sh](mdc:run-local.sh)
+
+**Deliver today:**
+- Dashboard cards:
+  - unread conversations
+  - pending approvals
+  - today bookings
+  - campaign activity
+- Basic funnel metrics endpoint:
+  - inbound count
+  - booked count
+  - conversion %
+
+**Done when:**
+- Owner can open dashboard and understand today's business at a glance.
+
+---
+
+## Status Note Template
+
+When completing work, add a status note:
+
+```
+## [Agent Name] Status
+
+**What works:**
+- 
+
+**What's left:**
+- 
+
+**Blockers:**
+- 
+```
