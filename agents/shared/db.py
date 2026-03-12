@@ -5,7 +5,7 @@ from uuid import uuid4
 from contextlib import contextmanager
 from datetime import datetime as dt
 
-from .types import Business, Message, Lead, Appointment, Customer, ReengagementRule, ReengagementLog, ReengagementCampaign
+from .types import Business, Message, Lead, Appointment, Customer, ReengagementRule, ReengagementLog, ReengagementCampaign, CampaignRun, CampaignMessage
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./genie.db")
 
@@ -22,6 +22,7 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
+        # Create base tables first
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS businesses (
                 id TEXT PRIMARY KEY,
@@ -150,7 +151,15 @@ def init_db():
                 converted INTEGER DEFAULT 0
             );
 
-            -- Index for faster lookups
+        """)
+        conn.commit()
+    
+    # Run migrations to add optional columns
+    _migrate_db()
+    
+    # Now create indices that depend on migrated columns
+    with get_db() as conn:
+        conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_customers_segment ON customers(business_id, segment);
             CREATE INDEX IF NOT EXISTS idx_customers_last_service ON customers(business_id, last_service_date);
             CREATE INDEX IF NOT EXISTS idx_reengagement_log_campaign ON reengagement_log(campaign_id);
@@ -460,6 +469,166 @@ def cancel_appointment(appointment_id: str, reason: Optional[str] = None) -> boo
         )
         conn.commit()
         return True
+
+
+def check_time_conflict(
+    business_id: str,
+    requested_datetime: str,
+    duration: int = 60,
+    exclude_appointment_id: Optional[str] = None
+) -> Optional[Appointment]:
+    """
+    Check if a requested time slot conflicts with existing appointments.
+    Returns the conflicting appointment if found, None if slot is available.
+    
+    Args:
+        business_id: The business to check
+        requested_datetime: Datetime in "YYYY-MM-DD HH:MM" format
+        duration: Duration of the requested appointment in minutes
+        exclude_appointment_id: Appointment ID to exclude (for reschedule checks)
+    """
+    try:
+        requested_dt = dt.strptime(requested_datetime, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None  # Invalid format, let caller handle
+    
+    from datetime import timedelta
+    requested_end = requested_dt + timedelta(minutes=duration)
+    
+    with get_db() as conn:
+        # Get all pending appointments for this business
+        query = """SELECT * FROM appointments 
+                   WHERE business_id = ? AND status IN ('pending', 'confirmed')"""
+        params = [business_id]
+        
+        if exclude_appointment_id:
+            query += " AND id != ?"
+            params.append(exclude_appointment_id)
+        
+        rows = conn.execute(query, params).fetchall()
+        
+        for row in rows:
+            try:
+                appt_start = dt.strptime(row['datetime'], "%Y-%m-%d %H:%M")
+                appt_duration = row['duration'] or 60
+                appt_end = appt_start + timedelta(minutes=appt_duration)
+                
+                # Check for overlap:
+                # Conflict if requested starts before existing ends AND requested ends after existing starts
+                if requested_dt < appt_end and requested_end > appt_start:
+                    return Appointment(**dict(row))
+            except ValueError:
+                continue  # Skip appointments with invalid datetime format
+    
+    return None
+
+
+def find_available_slots(
+    business_id: str,
+    target_date: str,
+    duration: int = 60,
+    business_hours: tuple = (9, 18),
+    slot_interval: int = 30
+) -> List[str]:
+    """
+    Find available time slots on a given date.
+    
+    Args:
+        business_id: The business to check
+        target_date: Date in "YYYY-MM-DD" format
+        duration: Duration needed in minutes
+        business_hours: Tuple of (start_hour, end_hour)
+        slot_interval: Minutes between slot start times
+    
+    Returns:
+        List of available datetime strings in "YYYY-MM-DD HH:MM" format
+    """
+    from datetime import timedelta
+    
+    try:
+        date_obj = dt.strptime(target_date, "%Y-%m-%d").date()
+    except ValueError:
+        return []
+    
+    start_hour, end_hour = business_hours
+    available = []
+    
+    # Generate all possible slots
+    current_time = dt.combine(date_obj, dt.min.time().replace(hour=start_hour))
+    end_time = dt.combine(date_obj, dt.min.time().replace(hour=end_hour))
+    
+    while current_time + timedelta(minutes=duration) <= end_time:
+        slot_str = current_time.strftime("%Y-%m-%d %H:%M")
+        
+        # Check if this slot has a conflict
+        if check_time_conflict(business_id, slot_str, duration) is None:
+            available.append(slot_str)
+        
+        current_time += timedelta(minutes=slot_interval)
+    
+    return available
+
+
+def suggest_alternative_slots(
+    business_id: str,
+    requested_datetime: str,
+    duration: int = 60,
+    business_hours: tuple = (9, 18),
+    max_suggestions: int = 3
+) -> List[str]:
+    """
+    Suggest alternative available time slots near the requested time.
+    
+    Returns slots on the same day first, then adjacent days.
+    """
+    from datetime import timedelta
+    
+    try:
+        requested_dt = dt.strptime(requested_datetime, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return []
+    
+    suggestions = []
+    
+    # Try same day first
+    same_day_slots = find_available_slots(
+        business_id,
+        requested_dt.strftime("%Y-%m-%d"),
+        duration,
+        business_hours
+    )
+    
+    # Sort by proximity to requested time
+    same_day_slots.sort(key=lambda s: abs(
+        (dt.strptime(s, "%Y-%m-%d %H:%M") - requested_dt).total_seconds()
+    ))
+    
+    for slot in same_day_slots[:max_suggestions]:
+        if slot not in suggestions:
+            suggestions.append(slot)
+    
+    # If we need more, check adjacent days
+    if len(suggestions) < max_suggestions:
+        for day_offset in [1, -1, 2]:
+            if len(suggestions) >= max_suggestions:
+                break
+            
+            other_date = (requested_dt + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+            other_slots = find_available_slots(
+                business_id, other_date, duration, business_hours
+            )
+            
+            # Prefer similar time of day
+            target_hour = requested_dt.hour
+            other_slots.sort(key=lambda s: abs(
+                dt.strptime(s, "%Y-%m-%d %H:%M").hour - target_hour
+            ))
+            
+            for slot in other_slots:
+                if slot not in suggestions and len(suggestions) < max_suggestions:
+                    suggestions.append(slot)
+    
+    return suggestions
 
 
 # ============== Customer Functions ==============
@@ -1078,3 +1247,498 @@ def get_all_businesses() -> List[Business]:
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM businesses").fetchall()
         return [Business(**dict(row)) for row in rows]
+
+
+# ============== Campaign Run Logging ==============
+
+def _migrate_campaign_tables():
+    """Create campaign tables if they don't exist."""
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS campaign_runs (
+                id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL,
+                campaign_type TEXT NOT NULL,
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME,
+                customers_targeted INTEGER DEFAULT 0,
+                messages_sent INTEGER DEFAULT 0,
+                messages_failed INTEGER DEFAULT 0,
+                skipped_opted_out INTEGER DEFAULT 0,
+                skipped_already_booked INTEGER DEFAULT 0,
+                skipped_already_contacted INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'running'
+            );
+            
+            CREATE TABLE IF NOT EXISTS campaign_messages (
+                id TEXT PRIMARY KEY,
+                campaign_run_id TEXT NOT NULL,
+                business_id TEXT NOT NULL,
+                customer_phone TEXT NOT NULL,
+                customer_name TEXT,
+                campaign_type TEXT NOT NULL,
+                trigger_reason TEXT,
+                message_sent TEXT NOT NULL,
+                sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                response_received INTEGER DEFAULT 0,
+                booked_after INTEGER DEFAULT 0,
+                stop_reason TEXT
+            );
+        """)
+        conn.commit()
+
+
+def create_campaign_run(business_id: str, campaign_type: str) -> CampaignRun:
+    """Start a new campaign run."""
+    _migrate_campaign_tables()
+    run_id = str(uuid4())
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO campaign_runs (id, business_id, campaign_type) VALUES (?, ?, ?)""",
+            (run_id, business_id, campaign_type)
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM campaign_runs WHERE id = ?", (run_id,)).fetchone()
+        d = dict(row)
+        return CampaignRun(
+            id=d['id'],
+            business_id=d['business_id'],
+            campaign_type=d['campaign_type'],
+            started_at=d['started_at'],
+            completed_at=d.get('completed_at'),
+            customers_targeted=d.get('customers_targeted', 0),
+            messages_sent=d.get('messages_sent', 0),
+            messages_failed=d.get('messages_failed', 0),
+            skipped_opted_out=d.get('skipped_opted_out', 0),
+            skipped_already_booked=d.get('skipped_already_booked', 0),
+            skipped_already_contacted=d.get('skipped_already_contacted', 0),
+            status=d.get('status', 'running')
+        )
+
+
+def complete_campaign_run(
+    run_id: str,
+    customers_targeted: int,
+    messages_sent: int,
+    messages_failed: int,
+    skipped_opted_out: int = 0,
+    skipped_already_booked: int = 0,
+    skipped_already_contacted: int = 0,
+    status: str = 'completed'
+):
+    """Complete a campaign run with final stats."""
+    with get_db() as conn:
+        conn.execute(
+            """UPDATE campaign_runs SET 
+               completed_at = CURRENT_TIMESTAMP,
+               customers_targeted = ?,
+               messages_sent = ?,
+               messages_failed = ?,
+               skipped_opted_out = ?,
+               skipped_already_booked = ?,
+               skipped_already_contacted = ?,
+               status = ?
+               WHERE id = ?""",
+            (customers_targeted, messages_sent, messages_failed, 
+             skipped_opted_out, skipped_already_booked, skipped_already_contacted,
+             status, run_id)
+        )
+        conn.commit()
+
+
+def log_campaign_message(
+    campaign_run_id: str,
+    business_id: str,
+    customer_phone: str,
+    campaign_type: str,
+    message_sent: str,
+    customer_name: Optional[str] = None,
+    trigger_reason: Optional[str] = None
+) -> str:
+    """Log an individual campaign message."""
+    msg_id = str(uuid4())
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO campaign_messages 
+               (id, campaign_run_id, business_id, customer_phone, customer_name, 
+                campaign_type, trigger_reason, message_sent)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (msg_id, campaign_run_id, business_id, customer_phone, customer_name,
+             campaign_type, trigger_reason, message_sent)
+        )
+        conn.commit()
+    return msg_id
+
+
+def mark_campaign_message_responded(customer_phone: str, business_id: str, booked: bool = False):
+    """Mark recent campaign messages to this customer as responded."""
+    stop_reason = 'booked' if booked else 'replied'
+    with get_db() as conn:
+        conn.execute(
+            """UPDATE campaign_messages 
+               SET response_received = 1, booked_after = ?, stop_reason = ?
+               WHERE customer_phone = ? AND business_id = ? 
+               AND stop_reason IS NULL
+               AND sent_at >= datetime('now', '-7 days')""",
+            (1 if booked else 0, stop_reason, customer_phone, business_id)
+        )
+        conn.commit()
+
+
+def get_recent_campaign_runs(business_id: str, limit: int = 10) -> List[CampaignRun]:
+    """Get recent campaign runs for a business."""
+    _migrate_campaign_tables()
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM campaign_runs 
+               WHERE business_id = ? 
+               ORDER BY started_at DESC LIMIT ?""",
+            (business_id, limit)
+        ).fetchall()
+        return [CampaignRun(
+            id=d['id'],
+            business_id=d['business_id'],
+            campaign_type=d['campaign_type'],
+            started_at=d['started_at'],
+            completed_at=d.get('completed_at'),
+            customers_targeted=d.get('customers_targeted', 0),
+            messages_sent=d.get('messages_sent', 0),
+            messages_failed=d.get('messages_failed', 0),
+            skipped_opted_out=d.get('skipped_opted_out', 0),
+            skipped_already_booked=d.get('skipped_already_booked', 0),
+            skipped_already_contacted=d.get('skipped_already_contacted', 0),
+            status=d.get('status', 'running')
+        ) for d in [dict(row) for row in rows]]
+
+
+def was_customer_contacted_recently(business_id: str, customer_phone: str, campaign_type: str, days: int = 7) -> bool:
+    """Check if customer was already contacted for this campaign type recently."""
+    _migrate_campaign_tables()
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT id FROM campaign_messages 
+               WHERE business_id = ? AND customer_phone = ? AND campaign_type = ?
+               AND sent_at >= datetime('now', '-' || ? || ' days')
+               LIMIT 1""",
+            (business_id, customer_phone, campaign_type, days)
+        ).fetchone()
+        return row is not None
+
+
+# ============== No-Show Detection ==============
+
+def get_no_show_appointments(business_id: str, hours_ago: int = 24) -> List[Appointment]:
+    """
+    Get appointments that are likely no-shows:
+    - Appointment datetime has passed
+    - Status is still 'pending' or 'confirmed' (not completed/cancelled/no_show)
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM appointments 
+               WHERE business_id = ? 
+               AND status IN ('pending', 'confirmed')
+               AND datetime < datetime('now', 'localtime', '-1 hour')
+               AND datetime >= datetime('now', 'localtime', '-' || ? || ' hours')
+               ORDER BY datetime DESC""",
+            (business_id, hours_ago)
+        ).fetchall()
+        return [Appointment(**dict(row)) for row in rows]
+
+
+def mark_appointment_no_show(appointment_id: str) -> bool:
+    """Mark an appointment as a no-show."""
+    with get_db() as conn:
+        result = conn.execute(
+            """UPDATE appointments SET status = 'no_show', notes = COALESCE(notes || ' | ', '') || 'Marked as no-show'
+               WHERE id = ? AND status IN ('pending', 'confirmed')""",
+            (appointment_id,)
+        )
+        conn.commit()
+        return result.rowcount > 0
+
+
+def get_completed_appointments_since(business_id: str, hours_ago: int = 24) -> List[Appointment]:
+    """Get recently completed appointments for post-visit follow-up."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM appointments 
+               WHERE business_id = ? 
+               AND status = 'completed'
+               AND datetime >= datetime('now', 'localtime', '-' || ? || ' hours')
+               ORDER BY datetime DESC""",
+            (business_id, hours_ago)
+        ).fetchall()
+        return [Appointment(**dict(row)) for row in rows]
+
+
+def has_upcoming_appointment(business_id: str, customer_phone: str) -> bool:
+    """Check if customer already has an upcoming appointment."""
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT id FROM appointments 
+               WHERE business_id = ? AND customer_phone = ?
+               AND status IN ('pending', 'confirmed')
+               AND datetime >= datetime('now', 'localtime')
+               LIMIT 1""",
+            (business_id, customer_phone)
+        ).fetchone()
+        return row is not None
+
+
+def get_lapsed_customers(business_id: str, min_days: int, max_days: int) -> List[Customer]:
+    """
+    Get customers who haven't visited in a while.
+    For win-back campaigns.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM customers 
+               WHERE business_id = ? 
+               AND opted_out = 0
+               AND last_service_date IS NOT NULL
+               AND date(last_service_date) <= date('now', '-' || ? || ' days')
+               AND date(last_service_date) >= date('now', '-' || ? || ' days')
+               ORDER BY last_service_date ASC""",
+            (business_id, min_days, max_days)
+        ).fetchall()
+        return [_row_to_customer(row) for row in rows]
+
+
+# ============== AI Settings Functions ==============
+
+def _ensure_ai_settings_table():
+    """Ensure AI settings table exists."""
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_settings (
+                business_id TEXT PRIMARY KEY REFERENCES businesses(id),
+                ai_paused INTEGER DEFAULT 0,
+                paused_at DATETIME,
+                paused_by TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+
+def get_ai_settings(business_id: str) -> dict:
+    """Get AI settings for a business."""
+    _ensure_ai_settings_table()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM ai_settings WHERE business_id = ?",
+            (business_id,)
+        ).fetchone()
+        
+        if not row:
+            # Create default settings
+            conn.execute(
+                "INSERT INTO ai_settings (business_id) VALUES (?)",
+                (business_id,)
+            )
+            conn.commit()
+            return {"business_id": business_id, "ai_paused": False}
+        
+        return {
+            "business_id": row['business_id'],
+            "ai_paused": bool(row['ai_paused']),
+            "paused_at": row['paused_at'],
+            "paused_by": row['paused_by']
+        }
+
+
+def is_ai_paused(business_id: str) -> bool:
+    """Check if AI is paused for a business."""
+    settings = get_ai_settings(business_id)
+    return settings.get("ai_paused", False)
+
+
+def pause_ai(business_id: str, paused_by: str = "owner") -> None:
+    """Pause AI for a business."""
+    _ensure_ai_settings_table()
+    with get_db() as conn:
+        # Upsert
+        conn.execute("""
+            INSERT INTO ai_settings (business_id, ai_paused, paused_at, paused_by, updated_at)
+            VALUES (?, 1, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(business_id) DO UPDATE SET 
+                ai_paused = 1, paused_at = CURRENT_TIMESTAMP, paused_by = ?, updated_at = CURRENT_TIMESTAMP
+        """, (business_id, paused_by, paused_by))
+        conn.commit()
+
+
+def resume_ai(business_id: str) -> None:
+    """Resume AI for a business."""
+    _ensure_ai_settings_table()
+    with get_db() as conn:
+        conn.execute("""
+            UPDATE ai_settings 
+            SET ai_paused = 0, paused_at = NULL, paused_by = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE business_id = ?
+        """, (business_id,))
+        conn.commit()
+
+
+# ============== Approval Queue Functions ==============
+
+def _ensure_approval_queue_table():
+    """Ensure approval queue table exists."""
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS approval_queue (
+                id TEXT PRIMARY KEY,
+                business_id TEXT NOT NULL REFERENCES businesses(id),
+                recipient_phone TEXT NOT NULL,
+                recipient_name TEXT,
+                message_text TEXT NOT NULL,
+                reason TEXT,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected', 'expired')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at DATETIME,
+                reviewed_by TEXT
+            )
+        """)
+        conn.commit()
+
+
+def create_approval_request(
+    business_id: str,
+    recipient_phone: str,
+    message_text: str,
+    reason: Optional[str] = None,
+    recipient_name: Optional[str] = None
+) -> str:
+    """Create a message that needs owner approval before sending."""
+    _ensure_approval_queue_table()
+    approval_id = str(uuid4())
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO approval_queue (id, business_id, recipient_phone, recipient_name, message_text, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (approval_id, business_id, recipient_phone, recipient_name, message_text, reason))
+        conn.commit()
+    return approval_id
+
+
+def get_pending_approvals(business_id: str) -> List[dict]:
+    """Get all pending approval requests."""
+    _ensure_approval_queue_table()
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT * FROM approval_queue 
+            WHERE business_id = ? AND status = 'pending'
+            ORDER BY created_at DESC
+        """, (business_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_pending_approval_count(business_id: str) -> int:
+    """Get count of pending approvals."""
+    _ensure_approval_queue_table()
+    with get_db() as conn:
+        result = conn.execute("""
+            SELECT COUNT(*) as count FROM approval_queue 
+            WHERE business_id = ? AND status = 'pending'
+        """, (business_id,)).fetchone()
+        return result['count'] if result else 0
+
+
+def get_approval_by_id(approval_id: str) -> Optional[dict]:
+    """Get a single approval request by ID."""
+    _ensure_approval_queue_table()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM approval_queue WHERE id = ?",
+            (approval_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def approve_message(approval_id: str, reviewed_by: str = "owner") -> Optional[dict]:
+    """Approve a pending message."""
+    _ensure_approval_queue_table()
+    with get_db() as conn:
+        conn.execute("""
+            UPDATE approval_queue 
+            SET status = 'approved', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?
+            WHERE id = ? AND status = 'pending'
+        """, (reviewed_by, approval_id))
+        conn.commit()
+    return get_approval_by_id(approval_id)
+
+
+def reject_message(approval_id: str, reviewed_by: str = "owner") -> Optional[dict]:
+    """Reject a pending message."""
+    _ensure_approval_queue_table()
+    with get_db() as conn:
+        conn.execute("""
+            UPDATE approval_queue 
+            SET status = 'rejected', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?
+            WHERE id = ? AND status = 'pending'
+        """, (reviewed_by, approval_id))
+        conn.commit()
+    return get_approval_by_id(approval_id)
+
+
+# ============== Summary/Stats Functions ==============
+
+def get_today_summary(business_id: str) -> dict:
+    """Get a summary of today's activity for the owner."""
+    today = dt.now().strftime("%Y-%m-%d")
+    
+    with get_db() as conn:
+        # Messages today
+        msg_count = conn.execute("""
+            SELECT COUNT(*) as count FROM conversations 
+            WHERE business_id = ? AND date(created_at) = date(?)
+        """, (business_id, today)).fetchone()['count']
+        
+        # Inbound customer messages today
+        customer_msgs = conn.execute("""
+            SELECT COUNT(*) as count FROM conversations 
+            WHERE business_id = ? AND role = 'customer' AND direction = 'inbound' 
+            AND date(created_at) = date(?)
+        """, (business_id, today)).fetchone()['count']
+        
+        # Unique customers today
+        unique_customers = conn.execute("""
+            SELECT COUNT(DISTINCT participant_phone) as count FROM conversations 
+            WHERE business_id = ? AND role = 'customer' AND date(created_at) = date(?)
+        """, (business_id, today)).fetchone()['count']
+        
+        # Today's appointments
+        appts_today = conn.execute("""
+            SELECT COUNT(*) as count FROM appointments 
+            WHERE business_id = ? AND date(datetime) = date(?)
+        """, (business_id, today)).fetchone()['count']
+        
+        # Pending appointments (upcoming)
+        pending_appts = conn.execute("""
+            SELECT COUNT(*) as count FROM appointments 
+            WHERE business_id = ? AND status = 'pending' AND datetime >= datetime('now')
+        """, (business_id,)).fetchone()['count']
+        
+        # New leads today
+        new_leads = conn.execute("""
+            SELECT COUNT(*) as count FROM leads 
+            WHERE business_id = ? AND status = 'new' AND date(created_at) = date(?)
+        """, (business_id, today)).fetchone()['count']
+        
+        # Pending approvals
+        pending_approvals = get_pending_approval_count(business_id)
+        
+        # AI status
+        ai_paused = is_ai_paused(business_id)
+        
+        return {
+            "date": today,
+            "messages_today": msg_count,
+            "customer_messages": customer_msgs,
+            "unique_customers": unique_customers,
+            "appointments_today": appts_today,
+            "pending_appointments": pending_appts,
+            "new_leads": new_leads,
+            "pending_approvals": pending_approvals,
+            "ai_paused": ai_paused
+        }

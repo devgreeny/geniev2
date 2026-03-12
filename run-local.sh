@@ -59,7 +59,18 @@ npm run dev &
 GATEWAY_PID=$!
 cd ..
 
+# Wait for gateway to be ready
+sleep 2
+
+# Start Dashboard (port 5173)
+echo -e "${GREEN}Starting Dashboard on :5173${NC}"
+cd dashboard
+npm run dev &
+DASHBOARD_PID=$!
+cd ..
+
 echo -e "\n${GREEN}All services running!${NC}"
+echo "  Dashboard:        http://localhost:5173"
 echo "  Gateway:          http://localhost:3000"
 echo "  Master Agent:     http://localhost:8001"
 echo "  Customer Service: http://localhost:8002"

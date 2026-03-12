@@ -8,6 +8,7 @@ interface Message {
   participant_phone: string
   created_at: string
   role: string
+  read_at: string | null
 }
 
 interface Business {
@@ -30,11 +31,37 @@ interface Lead {
   created_at: string
 }
 
-interface Stats {
-  messages_today: number
-  total_conversations: number
-  new_leads: number
-  active_customers: number
+interface Booking {
+  id: string
+  customer_name: string
+  customer_phone: string
+  service: string
+  datetime: string
+  status: string
+}
+
+interface Approval {
+  id: string
+  recipient_phone: string
+  recipient_name: string | null
+  message_text: string
+  reason: string | null
+  status: string
+  created_at: string
+}
+
+interface TodayView {
+  unread_conversations: number
+  pending_approvals: number
+  today_bookings: number
+  bookings: Booking[]
+  campaigns_sent_today: number
+  ai_paused: boolean
+  funnel: {
+    inbound: number
+    booked: number
+    conversion_rate: number
+  }
 }
 
 const API_URL = 'http://localhost:3000'
@@ -43,26 +70,27 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [business, setBusiness] = useState<Business | null>(null)
   const [leads, setLeads] = useState<Lead[]>([])
-  const [stats, setStats] = useState<Stats>({ messages_today: 0, total_conversations: 0, new_leads: 0, active_customers: 0 })
-  const [currentPage, setCurrentPage] = useState<'messages' | 'leads' | 'settings'>('messages')
+  const [todayView, setTodayView] = useState<TodayView | null>(null)
+  const [approvals, setApprovals] = useState<Approval[]>([])
+  const [currentPage, setCurrentPage] = useState<'today' | 'messages' | 'leads' | 'settings'>('today')
   const [isEditing, setIsEditing] = useState(false)
   const [formData, setFormData] = useState<Partial<Business>>({})
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date())
 
   useEffect(() => {
     loadData()
-    // Auto-refresh every 10 seconds
     const interval = setInterval(loadData, 10000)
     return () => clearInterval(interval)
   }, [])
 
   async function loadData() {
     try {
-      const [messagesRes, businessRes, leadsRes, statsRes] = await Promise.all([
+      const [messagesRes, businessRes, leadsRes, todayRes, approvalsRes] = await Promise.all([
         fetch(`${API_URL}/api/messages`),
         fetch(`${API_URL}/api/business`),
         fetch(`${API_URL}/api/leads`),
-        fetch(`${API_URL}/api/stats`),
+        fetch(`${API_URL}/api/today`),
+        fetch(`${API_URL}/api/approvals`),
       ])
       
       if (messagesRes.ok) setMessages(await messagesRes.json())
@@ -72,7 +100,8 @@ function App() {
         setFormData(b)
       }
       if (leadsRes.ok) setLeads(await leadsRes.json())
-      if (statsRes.ok) setStats(await statsRes.json())
+      if (todayRes.ok) setTodayView(await todayRes.json())
+      if (approvalsRes.ok) setApprovals(await approvalsRes.json())
       setLastRefresh(new Date())
     } catch (err) {
       console.error('Could not load data:', err)
@@ -91,11 +120,28 @@ function App() {
         setBusiness(updated)
         setFormData(updated)
         setIsEditing(false)
-        alert('Settings saved successfully!')
       }
     } catch (err) {
       console.error('Could not save:', err)
-      alert('Could not save settings. Please try again.')
+    }
+  }
+
+  async function toggleAi() {
+    try {
+      const endpoint = todayView?.ai_paused ? '/api/ai/resume' : '/api/ai/pause'
+      await fetch(`${API_URL}${endpoint}`, { method: 'POST' })
+      loadData()
+    } catch (err) {
+      console.error('Could not toggle AI:', err)
+    }
+  }
+
+  async function handleApproval(id: string, action: 'approve' | 'reject') {
+    try {
+      await fetch(`${API_URL}/api/approvals/${id}/${action}`, { method: 'POST' })
+      loadData()
+    } catch (err) {
+      console.error(`Could not ${action}:`, err)
     }
   }
 
@@ -124,7 +170,6 @@ function App() {
   }
 
   function formatPhone(phone: string) {
-    // Format phone number nicely
     const cleaned = phone.replace(/\D/g, '')
     if (cleaned.length === 11 && cleaned.startsWith('1')) {
       return `(${cleaned.slice(1,4)}) ${cleaned.slice(4,7)}-${cleaned.slice(7)}`
@@ -139,249 +184,343 @@ function App() {
     <div className="app">
       {/* HEADER */}
       <header className="header">
-        <h1>✨ Genie Dashboard</h1>
-        <div className="business-name">{business?.business_name || 'Loading...'}</div>
+        <div className="header-left">
+          <div className="logo">
+            <span className="logo-icon">◆</span>
+            <span className="logo-text">genie</span>
+          </div>
+          <div className="business-badge">{business?.business_name || 'Loading...'}</div>
+        </div>
+        <div className="header-right">
+          <div className="ai-status" onClick={toggleAi}>
+            <span className={`ai-indicator ${todayView?.ai_paused ? 'paused' : 'active'}`}></span>
+            <span>AI {todayView?.ai_paused ? 'Paused' : 'Active'}</span>
+          </div>
+          <span className="last-update">Updated {lastRefresh.toLocaleTimeString()}</span>
+        </div>
       </header>
 
-      {/* STATS ROW */}
-      <div className="stats-row">
-        <div className="stat-box">
-          <span className="number">{stats.messages_today}</span>
-          <span className="label">Messages Today</span>
-        </div>
-        <div className="stat-box">
-          <span className="number">{stats.active_customers}</span>
-          <span className="label">Active Customers</span>
-        </div>
-        <div className="stat-box">
-          <span className="number">{stats.new_leads}</span>
-          <span className="label">New Leads</span>
-        </div>
-        <div className="stat-box">
-          <span className="number">{stats.total_conversations}</span>
-          <span className="label">Total Messages</span>
-        </div>
-      </div>
-
       {/* NAVIGATION */}
-      <nav className="nav-tabs">
+      <nav className="nav">
         <button 
-          className={`nav-tab ${currentPage === 'messages' ? 'active' : ''}`}
+          className={`nav-item ${currentPage === 'today' ? 'active' : ''}`}
+          onClick={() => setCurrentPage('today')}
+        >
+          <span className="nav-icon">◉</span>
+          Today
+        </button>
+        <button 
+          className={`nav-item ${currentPage === 'messages' ? 'active' : ''}`}
           onClick={() => setCurrentPage('messages')}
         >
-          📬 Messages
+          <span className="nav-icon">◈</span>
+          Messages
+          {todayView && todayView.unread_conversations > 0 && (
+            <span className="badge">{todayView.unread_conversations}</span>
+          )}
         </button>
         <button 
-          className={`nav-tab ${currentPage === 'leads' ? 'active' : ''}`}
+          className={`nav-item ${currentPage === 'leads' ? 'active' : ''}`}
           onClick={() => setCurrentPage('leads')}
         >
-          👥 Leads ({leads.length})
+          <span className="nav-icon">◇</span>
+          Leads
+          {leads.filter(l => l.status === 'new').length > 0 && (
+            <span className="badge">{leads.filter(l => l.status === 'new').length}</span>
+          )}
         </button>
         <button 
-          className={`nav-tab ${currentPage === 'settings' ? 'active' : ''}`}
+          className={`nav-item ${currentPage === 'settings' ? 'active' : ''}`}
           onClick={() => setCurrentPage('settings')}
         >
-          ⚙️ Settings
+          <span className="nav-icon">⚙</span>
+          Settings
         </button>
       </nav>
 
       {/* MAIN CONTENT */}
-      <main className="main-content">
+      <main className="main">
         
+        {/* TODAY VIEW */}
+        {currentPage === 'today' && todayView && (
+          <div className="today-view">
+            {/* Quick Stats Row */}
+            <div className="stats-grid">
+              <div className="stat-card highlight">
+                <div className="stat-value">{todayView.unread_conversations}</div>
+                <div className="stat-label">Unread Messages</div>
+                <div className="stat-action" onClick={() => setCurrentPage('messages')}>View →</div>
+              </div>
+              <div className={`stat-card ${todayView.pending_approvals > 0 ? 'alert' : ''}`}>
+                <div className="stat-value">{todayView.pending_approvals}</div>
+                <div className="stat-label">Pending Approvals</div>
+                {todayView.pending_approvals > 0 && <div className="stat-action">Review below ↓</div>}
+              </div>
+              <div className="stat-card">
+                <div className="stat-value">{todayView.today_bookings}</div>
+                <div className="stat-label">Today's Bookings</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-value">{todayView.campaigns_sent_today}</div>
+                <div className="stat-label">Campaigns Sent</div>
+              </div>
+            </div>
+
+            {/* Approval Queue */}
+            {approvals.length > 0 && (
+              <section className="section approval-section">
+                <h2 className="section-title">
+                  <span className="section-icon">⚡</span>
+                  Needs Your Approval
+                </h2>
+                <div className="approval-list">
+                  {approvals.map(approval => (
+                    <div key={approval.id} className="approval-card">
+                      <div className="approval-header">
+                        <span className="approval-to">To: {approval.recipient_name || formatPhone(approval.recipient_phone)}</span>
+                        {approval.reason && <span className="approval-reason">{approval.reason}</span>}
+                      </div>
+                      <div className="approval-message">"{approval.message_text}"</div>
+                      <div className="approval-actions">
+                        <button 
+                          className="btn btn-approve"
+                          onClick={() => handleApproval(approval.id, 'approve')}
+                        >
+                          ✓ Approve & Send
+                        </button>
+                        <button 
+                          className="btn btn-reject"
+                          onClick={() => handleApproval(approval.id, 'reject')}
+                        >
+                          ✕ Reject
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* Today's Schedule */}
+            <section className="section">
+              <h2 className="section-title">
+                <span className="section-icon">📅</span>
+                Today's Schedule
+              </h2>
+              {todayView.bookings.length === 0 ? (
+                <div className="empty-state">
+                  <p>No appointments scheduled for today.</p>
+                </div>
+              ) : (
+                <div className="schedule-list">
+                  {todayView.bookings.map(booking => (
+                    <div key={booking.id} className="schedule-item">
+                      <div className="schedule-time">{formatTime(booking.datetime)}</div>
+                      <div className="schedule-details">
+                        <div className="schedule-customer">{booking.customer_name || formatPhone(booking.customer_phone)}</div>
+                        <div className="schedule-service">{booking.service}</div>
+                      </div>
+                      <div className={`schedule-status ${booking.status}`}>{booking.status}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            {/* Conversion Funnel */}
+            <section className="section">
+              <h2 className="section-title">
+                <span className="section-icon">📊</span>
+                This Week's Funnel
+              </h2>
+              <div className="funnel">
+                <div className="funnel-stage">
+                  <div className="funnel-bar" style={{ width: '100%' }}></div>
+                  <div className="funnel-content">
+                    <span className="funnel-label">Inbound Customers</span>
+                    <span className="funnel-value">{todayView.funnel.inbound}</span>
+                  </div>
+                </div>
+                <div className="funnel-arrow">↓</div>
+                <div className="funnel-stage">
+                  <div 
+                    className="funnel-bar booked" 
+                    style={{ width: `${Math.max(todayView.funnel.conversion_rate, 5)}%` }}
+                  ></div>
+                  <div className="funnel-content">
+                    <span className="funnel-label">Booked</span>
+                    <span className="funnel-value">{todayView.funnel.booked}</span>
+                  </div>
+                </div>
+                <div className="funnel-conversion">
+                  <span className="conversion-rate">{todayView.funnel.conversion_rate}%</span>
+                  <span className="conversion-label">conversion rate</span>
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+
         {/* MESSAGES PAGE */}
         {currentPage === 'messages' && (
-          <>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-              <h2 className="section-title" style={{ marginBottom: 0, borderBottom: 'none', paddingBottom: 0 }}>
-                Recent Conversations
-              </h2>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
-                <span className="live-badge">
-                  <span className="live-dot"></span>
-                  Auto-updating
-                </span>
-                <button className="refresh-btn" onClick={loadData}>
-                  🔄 Refresh Now
-                </button>
-              </div>
+          <div className="messages-view">
+            <div className="page-header">
+              <h1>Messages</h1>
+              <button className="btn btn-secondary" onClick={loadData}>↻ Refresh</button>
             </div>
             
             {messages.length === 0 ? (
-              <div className="no-messages">
-                <p>📭 No messages yet.</p>
-                <p style={{ marginTop: '10px', color: '#888' }}>
-                  Messages will appear here when customers text your business number.
-                </p>
+              <div className="empty-state">
+                <p>No messages yet. They'll appear here when customers text.</p>
               </div>
             ) : (
               <div className="message-list">
                 {messages.map((msg, idx) => {
                   const showDate = idx === 0 || formatDate(messages[idx - 1].created_at) !== formatDate(msg.created_at)
                   const isCustomer = msg.direction === 'inbound'
+                  const isUnread = isCustomer && !msg.read_at
                   
                   return (
                     <div key={msg.id}>
                       {showDate && (
-                        <div className="date-separator">{formatDate(msg.created_at)}</div>
+                        <div className="date-divider">{formatDate(msg.created_at)}</div>
                       )}
-                      <div className={`message-item ${isCustomer ? 'from-customer' : 'from-genie'}`}>
-                        <div className="message-header">
-                          <span className="sender">
-                            {isCustomer ? `📱 Customer (${formatPhone(msg.participant_phone)})` : '🤖 Genie (Auto-Reply)'}
+                      <div className={`message ${isCustomer ? 'inbound' : 'outbound'} ${isUnread ? 'unread' : ''}`}>
+                        <div className="message-meta">
+                          <span className="message-sender">
+                            {isCustomer ? formatPhone(msg.participant_phone) : 'Genie AI'}
                           </span>
-                          <span className="time">{formatTime(msg.created_at)}</span>
+                          <span className="message-time">{formatTime(msg.created_at)}</span>
                         </div>
-                        <div className="message-text">{msg.message}</div>
+                        <div className="message-body">{msg.message}</div>
                       </div>
                     </div>
                   )
                 })}
               </div>
             )}
-          </>
+          </div>
         )}
 
         {/* LEADS PAGE */}
         {currentPage === 'leads' && (
-          <>
-            <h2 className="section-title">Your Leads</h2>
+          <div className="leads-view">
+            <div className="page-header">
+              <h1>Leads</h1>
+            </div>
             
             {leads.length === 0 ? (
-              <div className="no-leads">
-                <p>👥 No leads yet.</p>
-                <p style={{ marginTop: '10px', color: '#888' }}>
-                  When potential customers reach out, they'll be tracked here.
-                </p>
+              <div className="empty-state">
+                <p>No leads tracked yet. They'll appear when potential customers reach out.</p>
               </div>
             ) : (
               <div className="leads-list">
                 {leads.map(lead => (
-                  <div key={lead.id} className="lead-item">
-                    <div className="phone">{formatPhone(lead.customer_phone)}</div>
-                    {lead.customer_name && (
-                      <div className="name">👤 {lead.customer_name}</div>
-                    )}
-                    {lead.job_description && (
-                      <div className="description">
-                        <strong>What they said:</strong> "{lead.job_description}"
-                      </div>
-                    )}
-                    <div className="meta">
-                      <span className="date">{formatDate(lead.created_at)}</span>
-                      <span className={`status-badge ${lead.status}`}>{lead.status}</span>
+                  <div key={lead.id} className="lead-card">
+                    <div className="lead-header">
+                      <span className="lead-phone">{formatPhone(lead.customer_phone)}</span>
+                      <span className={`lead-status ${lead.status}`}>{lead.status}</span>
                     </div>
+                    {lead.customer_name && <div className="lead-name">{lead.customer_name}</div>}
+                    {lead.job_description && (
+                      <div className="lead-description">"{lead.job_description}"</div>
+                    )}
+                    <div className="lead-date">{formatDate(lead.created_at)}</div>
                   </div>
                 ))}
               </div>
             )}
-          </>
+          </div>
         )}
 
         {/* SETTINGS PAGE */}
         {currentPage === 'settings' && business && (
-          <>
-            <h2 className="section-title">Business Settings</h2>
-            <p style={{ marginBottom: '25px', color: '#666', fontSize: '16px' }}>
+          <div className="settings-view">
+            <div className="page-header">
+              <h1>Business Settings</h1>
+              {!isEditing ? (
+                <button className="btn btn-primary" onClick={() => setIsEditing(true)}>Edit</button>
+              ) : (
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <button className="btn btn-primary" onClick={saveSettings}>Save</button>
+                  <button className="btn btn-secondary" onClick={() => {
+                    setIsEditing(false)
+                    setFormData(business)
+                  }}>Cancel</button>
+                </div>
+              )}
+            </div>
+            
+            <p className="settings-description">
               This information helps Genie answer customer questions accurately.
             </p>
             
             <div className="settings-form">
-              <div className="form-field">
+              <div className="field">
                 <label>Business Name</label>
                 <input 
                   type="text"
                   value={formData.business_name || ''}
                   onChange={e => setFormData({...formData, business_name: e.target.value})}
                   disabled={!isEditing}
-                  placeholder="e.g., Joe's Barbershop"
                 />
               </div>
 
-              <div className="form-field">
-                <label>Services You Offer</label>
+              <div className="field">
+                <label>Services</label>
                 <textarea 
                   value={formData.services || ''}
                   onChange={e => setFormData({...formData, services: e.target.value})}
                   disabled={!isEditing}
-                  placeholder="e.g., Haircuts, beard trims, hot towel shaves"
+                  placeholder="List your services..."
                 />
-                <div className="hint">List what services your business provides</div>
               </div>
 
-              <div className="form-field">
+              <div className="field">
                 <label>Pricing</label>
                 <textarea 
                   value={formData.pricing || ''}
                   onChange={e => setFormData({...formData, pricing: e.target.value})}
                   disabled={!isEditing}
-                  placeholder="e.g., Haircut $25, Beard trim $15"
+                  placeholder="List your prices..."
                 />
-                <div className="hint">List your prices so Genie can quote customers</div>
               </div>
 
-              <div className="form-field">
+              <div className="field">
                 <label>Business Hours</label>
                 <input 
                   type="text"
                   value={formData.hours || ''}
                   onChange={e => setFormData({...formData, hours: e.target.value})}
                   disabled={!isEditing}
-                  placeholder="e.g., Mon-Sat 9am-6pm, Closed Sunday"
+                  placeholder="e.g., Mon-Sat 9am-6pm"
                 />
               </div>
 
-              <div className="form-field">
+              <div className="field">
                 <label>Current Availability</label>
                 <input 
                   type="text"
                   value={formData.availability || ''}
                   onChange={e => setFormData({...formData, availability: e.target.value})}
                   disabled={!isEditing}
-                  placeholder="e.g., Walk-ins welcome, Booked until Friday"
+                  placeholder="e.g., Walk-ins welcome"
                 />
-                <div className="hint">Update this when your schedule changes</div>
               </div>
 
-              <div className="form-field">
+              <div className="field">
                 <label>Special Notes for Genie</label>
                 <textarea 
                   value={formData.custom_context || ''}
                   onChange={e => setFormData({...formData, custom_context: e.target.value})}
                   disabled={!isEditing}
-                  placeholder="e.g., Ask for Mike for the best fades. We're cash only. Parking in rear."
+                  placeholder="Any extra info Genie should know..."
                 />
-                <div className="hint">Any extra info you want Genie to know when chatting with customers</div>
-              </div>
-
-              <div className="button-row">
-                {isEditing ? (
-                  <>
-                    <button className="btn btn-primary" onClick={saveSettings}>
-                      💾 Save Changes
-                    </button>
-                    <button className="btn btn-secondary" onClick={() => {
-                      setIsEditing(false)
-                      setFormData(business)
-                    }}>
-                      ✕ Cancel
-                    </button>
-                  </>
-                ) : (
-                  <button className="btn btn-primary" onClick={() => setIsEditing(true)}>
-                    ✏️ Edit Settings
-                  </button>
-                )}
               </div>
             </div>
-          </>
+          </div>
         )}
       </main>
-
-      {/* FOOTER */}
-      <footer className="footer">
-        <p>Last updated: {lastRefresh.toLocaleTimeString()}</p>
-        <p style={{ marginTop: '5px' }}>Genie is working 24/7 to help your customers ✨</p>
-      </footer>
     </div>
   )
 }

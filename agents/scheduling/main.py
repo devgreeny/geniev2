@@ -7,12 +7,16 @@ Specializes in:
 - Canceling appointments
 - Checking appointment status
 - Using customer memory for smart suggestions
+- Conflict detection and alternate slot suggestions
 """
 
 import os
 import sys
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from typing import Optional, List
+from enum import Enum
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -32,6 +36,8 @@ from shared.db import (
     get_or_create_customer,
     update_customer_service,
     mark_reengagement_responded,
+    check_time_conflict,
+    suggest_alternative_slots,
 )
 from shared.memory import (
     get_memory_summary,
@@ -42,6 +48,87 @@ from shared.memory import (
 
 AGENTFIELD_URL = os.getenv("AGENTFIELD_URL", "http://localhost:8080")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+
+# ============== Structured Output Types ==============
+
+class SchedulingAction(str, Enum):
+    BOOK = "book"
+    RESCHEDULE = "reschedule"
+    CANCEL = "cancel"
+    CHECK_STATUS = "check_status"
+    CONFIRM_CANCEL = "confirm_cancel"
+    CONFIRM_RESCHEDULE = "confirm_reschedule"
+    SUGGEST_ALTERNATIVES = "suggest_alternatives"
+    COLLECT_INFO = "collect_info"
+    GENERAL = "general"
+
+
+class SchedulingStatus(str, Enum):
+    SUCCESS = "success"
+    PENDING_CONFIRMATION = "pending_confirmation"
+    CONFLICT_DETECTED = "conflict_detected"
+    NEED_MORE_INFO = "need_more_info"
+    NO_APPOINTMENTS = "no_appointments"
+    FAILED = "failed"
+
+
+@dataclass
+class SchedulingResult:
+    """Structured output for scheduling operations."""
+    action: str
+    status: str
+    reply: str
+    next_prompt: Optional[str] = None  # What we're waiting for from customer
+    appointment_id: Optional[str] = None
+    conflict_with: Optional[str] = None  # Conflicting appointment details
+    suggested_slots: Optional[List[str]] = None
+    data: Optional[dict] = None  # Additional context
+    
+    def to_dict(self) -> dict:
+        result = {"reply": self.reply, "action": self.action, "status": self.status}
+        if self.next_prompt:
+            result["next_prompt"] = self.next_prompt
+        if self.appointment_id:
+            result["appointment_id"] = self.appointment_id
+        if self.conflict_with:
+            result["conflict_with"] = self.conflict_with
+        if self.suggested_slots:
+            result["suggested_slots"] = self.suggested_slots
+        if self.data:
+            result["data"] = self.data
+        return result
+
+
+def parse_business_hours(hours_str: str) -> tuple:
+    """Parse business hours string to (start_hour, end_hour) tuple."""
+    # Default hours
+    default = (9, 18)
+    if not hours_str:
+        return default
+    
+    try:
+        # Try to extract hours from common formats like "9am-6pm", "9:00-18:00", etc.
+        hours_str = hours_str.lower().replace(" ", "")
+        
+        # Look for patterns like "9am-5pm" or "9-5"
+        import re
+        match = re.search(r'(\d{1,2})(?::\d{2})?(?:am)?[^0-9]+(\d{1,2})(?::\d{2})?(?:pm)?', hours_str)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2))
+            
+            # Adjust for PM if needed
+            if 'pm' in hours_str and end < 12:
+                end += 12
+            if end < start:  # Handle cases like "9-5" meaning 9am-5pm
+                end += 12
+            
+            return (start, min(end, 23))
+    except:
+        pass
+    
+    return default
 
 app = Agent(
     node_id="scheduling",
@@ -65,17 +152,25 @@ Respond with JSON only:
   "intent": "BOOK" | "RESCHEDULE" | "CANCEL" | "CHECK_STATUS" | "GENERAL",
   "has_datetime": true/false,
   "datetime_mentioned": "extracted date/time or null",
+  "datetime_ambiguous": true/false,
   "has_service": true/false,
   "service_mentioned": "extracted service or null",
   "confidence": "high" | "medium" | "low"
 }
 
+IMPORTANT for datetime_ambiguous:
+- Set to true for vague times: "next week", "sometime soon", "afternoon", "this weekend"
+- Set to false for specific times: "Saturday at 2pm", "tomorrow 3:30", "March 15 at 10am"
+
 Examples:
-- "I need to reschedule my appointment" → {"intent": "RESCHEDULE", "has_datetime": false, ...}
+- "I need to reschedule my appointment" → {"intent": "RESCHEDULE", "has_datetime": false, "datetime_ambiguous": false, ...}
 - "Cancel my haircut" → {"intent": "CANCEL", "has_service": true, "service_mentioned": "haircut", ...}
-- "Can I come in Saturday at 2pm?" → {"intent": "BOOK", "has_datetime": true, "datetime_mentioned": "Saturday 2pm", ...}
+- "Can I come in Saturday at 2pm?" → {"intent": "BOOK", "has_datetime": true, "datetime_mentioned": "Saturday 2pm", "datetime_ambiguous": false, ...}
+- "Can I come in sometime next week?" → {"intent": "BOOK", "has_datetime": true, "datetime_mentioned": "next week", "datetime_ambiguous": true, ...}
 - "When's my next appointment?" → {"intent": "CHECK_STATUS", ...}
-- "Do you do fades?" → {"intent": "GENERAL", ...}""",
+- "Do you do fades?" → {"intent": "GENERAL", ...}
+- "I want to book for the afternoon" → {"intent": "BOOK", "has_datetime": true, "datetime_mentioned": "afternoon", "datetime_ambiguous": true, ...}
+- "Book me in for tomorrow morning around 10" → {"intent": "BOOK", "has_datetime": true, "datetime_mentioned": "tomorrow morning around 10", "datetime_ambiguous": false, ...}""",
         user=message,
     )
     
@@ -91,11 +186,15 @@ Examples:
         start = result_text.find("{")
         end = result_text.rfind("}") + 1
         if start >= 0 and end > start:
-            return json.loads(result_text[start:end])
+            parsed = json.loads(result_text[start:end])
+            # Ensure datetime_ambiguous is set
+            if "datetime_ambiguous" not in parsed:
+                parsed["datetime_ambiguous"] = False
+            return parsed
     except:
         pass
     
-    return {"intent": "GENERAL", "confidence": "low"}
+    return {"intent": "GENERAL", "confidence": "low", "datetime_ambiguous": False}
 
 
 def format_appointment(appt) -> str:
@@ -208,7 +307,7 @@ async def handle_cancel(
     phone: str, message: str, business_id: str, context: dict,
     existing_appointments: list, customer_name: str, conversation_history: str
 ) -> dict:
-    """Handle appointment cancellation."""
+    """Handle appointment cancellation with confirmation gate."""
     business_name = context.get('business_name', 'our business')
     
     if not existing_appointments:
@@ -219,7 +318,12 @@ Let them know politely and offer to help them book something instead.
 Keep it brief - this is SMS.""",
             user=message,
         )
-        return {"reply": str(response)}
+        return SchedulingResult(
+            action=SchedulingAction.CANCEL.value,
+            status=SchedulingStatus.NO_APPOINTMENTS.value,
+            reply=str(response),
+            next_prompt="book_new"
+        ).to_dict()
     
     # If they have exactly one appointment, confirm cancellation
     if len(existing_appointments) == 1:
@@ -232,19 +336,39 @@ Respond with only: CONFIRM or REQUEST""",
             user=f"Previous context: {conversation_history[-500:] if conversation_history else 'None'}\nCurrent message: {message}",
         )
         
-        if "CONFIRM" in str(confirm_check).upper() or any(word in message.lower() for word in ["yes", "yeah", "yep", "confirm", "correct", "that's right", "please cancel"]):
+        is_confirmation = "CONFIRM" in str(confirm_check).upper() or any(
+            word in message.lower() for word in ["yes", "yeah", "yep", "confirm", "correct", "that's right", "please cancel"]
+        )
+        
+        if is_confirmation:
             # Actually cancel the appointment
             success = cancel_appointment(appt.id, reason="Cancelled by customer via text")
             
             if success:
                 name_greeting = f"{customer_name}, your" if customer_name else "Your"
-                return {"reply": f"Done! {name_greeting} {format_appointment(appt)} has been cancelled. Let us know when you'd like to rebook! 👋"}
+                return SchedulingResult(
+                    action=SchedulingAction.CANCEL.value,
+                    status=SchedulingStatus.SUCCESS.value,
+                    reply=f"Done! {name_greeting} {format_appointment(appt)} has been cancelled. Let us know when you'd like to rebook! 👋",
+                    appointment_id=appt.id
+                ).to_dict()
             else:
-                return {"reply": "Sorry, I had trouble cancelling that appointment. Please try again or contact us directly."}
+                return SchedulingResult(
+                    action=SchedulingAction.CANCEL.value,
+                    status=SchedulingStatus.FAILED.value,
+                    reply="Sorry, I had trouble cancelling that appointment. Please try again or contact us directly.",
+                    appointment_id=appt.id
+                ).to_dict()
         else:
             # Ask for confirmation
             name_greeting = f"Hey {customer_name}!" if customer_name else "Hey!"
-            return {"reply": f"{name_greeting} Just to confirm - you want to cancel your {format_appointment(appt)}? Reply 'yes' to confirm."}
+            return SchedulingResult(
+                action=SchedulingAction.CONFIRM_CANCEL.value,
+                status=SchedulingStatus.PENDING_CONFIRMATION.value,
+                reply=f"{name_greeting} Just to confirm - you want to cancel your {format_appointment(appt)}? Reply 'yes' to confirm.",
+                appointment_id=appt.id,
+                next_prompt="confirmation"
+            ).to_dict()
     
     # Multiple appointments - ask which one
     response = await app.ai(
@@ -256,7 +380,12 @@ Ask them which appointment they want to cancel. Be brief - this is SMS.
 {f'Address them as {customer_name}.' if customer_name else ''}""",
         user=message,
     )
-    return {"reply": str(response)}
+    return SchedulingResult(
+        action=SchedulingAction.CANCEL.value,
+        status=SchedulingStatus.NEED_MORE_INFO.value,
+        reply=str(response),
+        next_prompt="which_appointment"
+    ).to_dict()
 
 
 async def handle_reschedule(
@@ -264,10 +393,11 @@ async def handle_reschedule(
     existing_appointments: list, customer_name: str, intent_info: dict,
     booked_times: list, conversation_history: str
 ) -> dict:
-    """Handle appointment rescheduling."""
+    """Handle appointment rescheduling with conflict detection and confirmation gates."""
     business_name = context.get('business_name', 'our business')
     availability = context.get('availability', 'Available')
     hours = context.get('hours', 'Contact for hours')
+    business_hours = parse_business_hours(hours)
     
     if not existing_appointments:
         response = await app.ai(
@@ -277,10 +407,19 @@ Let them know politely and offer to help them book something new.
 Keep it brief - this is SMS.""",
             user=message,
         )
-        return {"reply": str(response)}
+        return SchedulingResult(
+            action=SchedulingAction.RESCHEDULE.value,
+            status=SchedulingStatus.NO_APPOINTMENTS.value,
+            reply=str(response),
+            next_prompt="book_new"
+        ).to_dict()
     
     # Get the appointment to reschedule
     appt_to_reschedule = existing_appointments[0]  # Default to first
+    duration = appt_to_reschedule.duration or 60
+    
+    # Check if this is a confirmation of a pending reschedule
+    is_confirmation = await _check_reschedule_confirmation(message, conversation_history)
     
     # If they mentioned a new time, try to reschedule
     if intent_info.get("has_datetime") and intent_info.get("datetime_mentioned"):
@@ -311,29 +450,113 @@ Availability: {availability}
 {f'Address them as {customer_name}.' if customer_name else ''}""",
                 user=message,
             )
-            return {"reply": str(response)}
+            return SchedulingResult(
+                action=SchedulingAction.RESCHEDULE.value,
+                status=SchedulingStatus.NEED_MORE_INFO.value,
+                reply=str(response),
+                next_prompt="specific_datetime"
+            ).to_dict()
         
         elif parsed == "OUTSIDE_HOURS":
-            return {"reply": f"Sorry, that time is outside our hours ({hours}). When else works for you?"}
+            # Suggest alternatives
+            target_date = datetime.now().strftime("%Y-%m-%d")
+            alternatives = suggest_alternative_slots(
+                business_id, f"{target_date} 12:00", duration, business_hours
+            )
+            
+            if alternatives:
+                alt_formatted = format_slot_suggestions(alternatives[:3])
+                return SchedulingResult(
+                    action=SchedulingAction.SUGGEST_ALTERNATIVES.value,
+                    status=SchedulingStatus.CONFLICT_DETECTED.value,
+                    reply=f"Sorry, that time is outside our hours ({hours}). How about one of these?\n{alt_formatted}",
+                    suggested_slots=alternatives[:3],
+                    next_prompt="select_alternative"
+                ).to_dict()
+            else:
+                return SchedulingResult(
+                    action=SchedulingAction.RESCHEDULE.value,
+                    status=SchedulingStatus.FAILED.value,
+                    reply=f"Sorry, that time is outside our hours ({hours}). When else works for you?"
+                ).to_dict()
         
         elif len(parsed) >= 10:  # Looks like a valid datetime
-            # Check if time is available
-            if parsed in booked_times:
-                return {"reply": f"Sorry, {new_time} is already booked. What other time works for you?"}
+            # Check for time conflicts with duration overlap
+            conflict = check_time_conflict(
+                business_id, parsed, duration, 
+                exclude_appointment_id=appt_to_reschedule.id
+            )
+            
+            if conflict:
+                # Find alternative slots
+                alternatives = suggest_alternative_slots(
+                    business_id, parsed, duration, business_hours
+                )
+                
+                if alternatives:
+                    alt_formatted = format_slot_suggestions(alternatives[:3])
+                    return SchedulingResult(
+                        action=SchedulingAction.SUGGEST_ALTERNATIVES.value,
+                        status=SchedulingStatus.CONFLICT_DETECTED.value,
+                        reply=f"Sorry, {new_time} overlaps with another appointment. How about one of these?\n{alt_formatted}",
+                        conflict_with=format_appointment(conflict),
+                        suggested_slots=alternatives[:3],
+                        next_prompt="select_alternative"
+                    ).to_dict()
+                else:
+                    return SchedulingResult(
+                        action=SchedulingAction.RESCHEDULE.value,
+                        status=SchedulingStatus.CONFLICT_DETECTED.value,
+                        reply=f"Sorry, {new_time} is already booked. What other time works for you?",
+                        conflict_with=format_appointment(conflict)
+                    ).to_dict()
+            
+            # No conflict - ask for confirmation before finalizing
+            if not is_confirmation:
+                try:
+                    new_dt = datetime.strptime(parsed, "%Y-%m-%d %H:%M")
+                    new_formatted = new_dt.strftime("%A, %B %d at %I:%M %p")
+                except:
+                    new_formatted = parsed
+                
+                name_greeting = f"{customer_name}, just" if customer_name else "Just"
+                return SchedulingResult(
+                    action=SchedulingAction.CONFIRM_RESCHEDULE.value,
+                    status=SchedulingStatus.PENDING_CONFIRMATION.value,
+                    reply=f"{name_greeting} to confirm - reschedule your {format_appointment(appt_to_reschedule)} to {new_formatted}? Reply 'yes' to confirm.",
+                    appointment_id=appt_to_reschedule.id,
+                    next_prompt="confirmation",
+                    data={"new_datetime": parsed}
+                ).to_dict()
             
             # Perform the reschedule
             updated = reschedule_appointment(appt_to_reschedule.id, parsed)
             
             if updated:
                 name_greeting = f"{customer_name}, you're" if customer_name else "You're"
-                return {"reply": f"Done! {name_greeting} now booked for {format_appointment(updated)}. See you then! ✅"}
+                return SchedulingResult(
+                    action=SchedulingAction.RESCHEDULE.value,
+                    status=SchedulingStatus.SUCCESS.value,
+                    reply=f"Done! {name_greeting} now booked for {format_appointment(updated)}. See you then! ✅",
+                    appointment_id=updated.id
+                ).to_dict()
             else:
-                return {"reply": "Sorry, I had trouble rescheduling. Please try again or contact us directly."}
+                return SchedulingResult(
+                    action=SchedulingAction.RESCHEDULE.value,
+                    status=SchedulingStatus.FAILED.value,
+                    reply="Sorry, I had trouble rescheduling. Please try again or contact us directly."
+                ).to_dict()
     
     # No new time mentioned - ask when they want to reschedule to
     if len(existing_appointments) == 1:
         name_greeting = f"Hey {customer_name}!" if customer_name else "Hey!"
-        return {"reply": f"{name_greeting} Sure, I can reschedule your {format_appointment(appt_to_reschedule)}. When would you like to come in instead?"}
+        return SchedulingResult(
+            action=SchedulingAction.RESCHEDULE.value,
+            status=SchedulingStatus.NEED_MORE_INFO.value,
+            reply=f"{name_greeting} Sure, I can reschedule your {format_appointment(appt_to_reschedule)}. When would you like to come in instead?",
+            appointment_id=appt_to_reschedule.id,
+            next_prompt="new_datetime"
+        ).to_dict()
     else:
         response = await app.ai(
             system=f"""You are the scheduling assistant for {business_name}.
@@ -344,7 +567,38 @@ Ask which one they want to reschedule. Be brief - this is SMS.
 {f'Address them as {customer_name}.' if customer_name else ''}""",
             user=message,
         )
-        return {"reply": str(response)}
+        return SchedulingResult(
+            action=SchedulingAction.RESCHEDULE.value,
+            status=SchedulingStatus.NEED_MORE_INFO.value,
+            reply=str(response),
+            next_prompt="which_appointment"
+        ).to_dict()
+
+
+async def _check_reschedule_confirmation(message: str, conversation_history: str) -> bool:
+    """Check if message is confirming a pending reschedule."""
+    confirm_words = ["yes", "yeah", "yep", "confirm", "correct", "that's right", "ok", "okay", "sure", "sounds good"]
+    msg_lower = message.lower().strip()
+    
+    # Quick check for confirmation words
+    if any(word in msg_lower for word in confirm_words):
+        # Check if recent conversation was asking for reschedule confirmation
+        if conversation_history and "reschedule" in conversation_history.lower()[-500:]:
+            if "confirm" in conversation_history.lower()[-200:] or "reply 'yes'" in conversation_history.lower()[-200:]:
+                return True
+    return False
+
+
+def format_slot_suggestions(slots: List[str]) -> str:
+    """Format time slot suggestions for display."""
+    formatted = []
+    for i, slot in enumerate(slots, 1):
+        try:
+            dt_obj = datetime.strptime(slot, "%Y-%m-%d %H:%M")
+            formatted.append(f"{i}. {dt_obj.strftime('%A %I:%M %p')}")
+        except:
+            formatted.append(f"{i}. {slot}")
+    return "\n".join(formatted)
 
 
 async def handle_check_status(
@@ -356,17 +610,33 @@ async def handle_check_status(
     
     if not existing_appointments:
         name_greeting = f"Hey {customer_name}!" if customer_name else "Hey!"
-        return {"reply": f"{name_greeting} You don't have any upcoming appointments with us. Would you like to book one?"}
+        return SchedulingResult(
+            action=SchedulingAction.CHECK_STATUS.value,
+            status=SchedulingStatus.NO_APPOINTMENTS.value,
+            reply=f"{name_greeting} You don't have any upcoming appointments with us. Would you like to book one?",
+            next_prompt="book_new"
+        ).to_dict()
     
     if len(existing_appointments) == 1:
         appt = existing_appointments[0]
         name_greeting = f"{customer_name}, your" if customer_name else "Your"
-        return {"reply": f"{name_greeting} next appointment is {format_appointment(appt)}. Need to make any changes?"}
+        return SchedulingResult(
+            action=SchedulingAction.CHECK_STATUS.value,
+            status=SchedulingStatus.SUCCESS.value,
+            reply=f"{name_greeting} next appointment is {format_appointment(appt)}. Need to make any changes?",
+            appointment_id=appt.id,
+            data={"appointment_count": 1}
+        ).to_dict()
     
     # Multiple appointments
     name_greeting = f"Hey {customer_name}!" if customer_name else "Hey!"
     appt_list = format_appointments_list(existing_appointments)
-    return {"reply": f"{name_greeting} Here are your upcoming appointments:\n{appt_list}\n\nNeed to change anything?"}
+    return SchedulingResult(
+        action=SchedulingAction.CHECK_STATUS.value,
+        status=SchedulingStatus.SUCCESS.value,
+        reply=f"{name_greeting} Here are your upcoming appointments:\n{appt_list}\n\nNeed to change anything?",
+        data={"appointment_count": len(existing_appointments)}
+    ).to_dict()
 
 
 async def handle_booking(
@@ -375,11 +645,12 @@ async def handle_booking(
     intent_info: dict, booked_times: list, memory_context: str,
     conversation_history: str
 ) -> dict:
-    """Handle new appointment booking."""
+    """Handle new appointment booking with conflict detection."""
     business_name = context.get('business_name', 'our business')
     availability = context.get('availability', 'Available')
     hours = context.get('hours', 'Contact for hours')
     services = context.get('services', 'our services')
+    business_hours = parse_business_hours(hours)
     
     # Check if customer already has an appointment
     has_existing = len(existing_appointments) > 0
@@ -394,7 +665,151 @@ async def handle_booking(
         if usual_service and preferred_day and preferred_time:
             suggestion = f"Based on your history, would you like your usual {usual_service} on {preferred_day} at {preferred_time}?"
     
-    # Generate response
+    # Handle ambiguous datetime early
+    if intent_info.get("datetime_ambiguous") and intent_info.get("has_datetime"):
+        datetime_mentioned = intent_info.get("datetime_mentioned", "")
+        service_mentioned = intent_info.get("service_mentioned", "")
+        name_greeting = f"Hey {customer_name}!" if customer_name else "Hey!"
+        
+        if service_mentioned:
+            return SchedulingResult(
+                action=SchedulingAction.COLLECT_INFO.value,
+                status=SchedulingStatus.NEED_MORE_INFO.value,
+                reply=f"{name_greeting} I can book a {service_mentioned} for you. What specific day and time works best? Our hours are {hours}.",
+                next_prompt="specific_datetime",
+                data={"service": service_mentioned, "ambiguous_time": datetime_mentioned}
+            ).to_dict()
+        else:
+            return SchedulingResult(
+                action=SchedulingAction.COLLECT_INFO.value,
+                status=SchedulingStatus.NEED_MORE_INFO.value,
+                reply=f"{name_greeting} I'd be happy to help! Can you give me a specific day and time? Our hours are {hours}.",
+                next_prompt="specific_datetime",
+                data={"ambiguous_time": datetime_mentioned}
+            ).to_dict()
+    
+    # Check if we have enough info to book
+    if intent_info.get("has_datetime") and intent_info.get("has_service"):
+        # Try to parse and book
+        booking_check = await app.ai(
+            system=f"""Based on this conversation, do we have enough info to book?
+Required: service type, date/time, customer name (optional but nice to have)
+
+Respond with JSON:
+{{
+  "can_book": true/false,
+  "service": "extracted service or null",
+  "datetime": "YYYY-MM-DD HH:MM format or null",
+  "duration_minutes": estimated duration based on service (default 60),
+  "customer_name": "name if mentioned or null",
+  "missing": ["list of missing info"],
+  "ambiguous_time": true/false (if time is vague like "afternoon" or "next week")
+}}
+
+Current date: {datetime.now().strftime('%Y-%m-%d')}
+Business hours: {hours}""",
+            user=f"Customer said: {message}\nConversation: {conversation_history[-500:] if conversation_history else ''}",
+        )
+        
+        try:
+            check_text = str(booking_check).strip()
+            if "```" in check_text:
+                check_text = check_text.split("```")[1]
+                if check_text.startswith("json"):
+                    check_text = check_text[4:]
+            
+            start = check_text.find("{")
+            end = check_text.rfind("}") + 1
+            if start >= 0 and end > start:
+                booking_info = json.loads(check_text[start:end])
+                
+                # Handle ambiguous time requests
+                if booking_info.get("ambiguous_time"):
+                    datetime_mentioned = intent_info.get("datetime_mentioned", "")
+                    return SchedulingResult(
+                        action=SchedulingAction.COLLECT_INFO.value,
+                        status=SchedulingStatus.NEED_MORE_INFO.value,
+                        reply=f"I'd love to book that for you! Can you give me a specific time? Our hours are {hours}.",
+                        next_prompt="specific_datetime",
+                        data={"service": booking_info.get("service"), "partial_datetime": datetime_mentioned}
+                    ).to_dict()
+                
+                if booking_info.get("can_book") and booking_info.get("service") and booking_info.get("datetime"):
+                    requested_datetime = booking_info["datetime"]
+                    duration = booking_info.get("duration_minutes", 60)
+                    
+                    # Check for time conflicts with proper duration overlap
+                    conflict = check_time_conflict(business_id, requested_datetime, duration)
+                    
+                    if conflict:
+                        # Find alternative slots
+                        alternatives = suggest_alternative_slots(
+                            business_id, requested_datetime, duration, business_hours
+                        )
+                        
+                        if alternatives:
+                            alt_formatted = format_slot_suggestions(alternatives[:3])
+                            return SchedulingResult(
+                                action=SchedulingAction.SUGGEST_ALTERNATIVES.value,
+                                status=SchedulingStatus.CONFLICT_DETECTED.value,
+                                reply=f"Sorry, that time slot is already taken. How about one of these?\n{alt_formatted}",
+                                conflict_with=format_appointment(conflict),
+                                suggested_slots=alternatives[:3],
+                                next_prompt="select_alternative",
+                                data={"service": booking_info.get("service")}
+                            ).to_dict()
+                        else:
+                            return SchedulingResult(
+                                action=SchedulingAction.BOOK.value,
+                                status=SchedulingStatus.CONFLICT_DETECTED.value,
+                                reply="Sorry, that time is already booked. What other time works for you?",
+                                conflict_with=format_appointment(conflict),
+                                data={"service": booking_info.get("service")}
+                            ).to_dict()
+                    
+                    # No conflict - create the appointment!
+                    appt = create_appointment(
+                        business_id=business_id,
+                        customer_phone=phone,
+                        service=booking_info["service"],
+                        datetime_str=requested_datetime,
+                        duration=duration,
+                        customer_name=booking_info.get("customer_name") or customer_name,
+                    )
+                    
+                    # Update customer memory with booking preferences
+                    try:
+                        dt_obj = datetime.strptime(booking_info["datetime"], "%Y-%m-%d %H:%M")
+                        update_customer_memory(business_id, phone, {
+                            "name": booking_info.get("customer_name") or customer_name,
+                            "preferences": {
+                                "usual_service": booking_info["service"],
+                                "preferred_day": dt_obj.strftime("%A"),
+                                "preferred_time": dt_obj.strftime("%I:%M %p").lstrip("0"),
+                            },
+                            "new_service": f"Booked {booking_info['service']}"
+                        })
+                    except Exception as e:
+                        print(f"[scheduling] Memory update failed: {e}")
+                    
+                    name_greeting = f"{customer_name or booking_info.get('customer_name', '')}, you're".strip(", ")
+                    if not name_greeting.startswith("you're"):
+                        name_greeting = name_greeting.capitalize()
+                    else:
+                        name_greeting = "You're"
+                    
+                    return SchedulingResult(
+                        action=SchedulingAction.BOOK.value,
+                        status=SchedulingStatus.SUCCESS.value,
+                        reply=f"Booked! {name_greeting} all set for {format_appointment(appt)}. See you then! ✅",
+                        appointment_id=appt.id,
+                        data={"service": booking_info["service"], "datetime": requested_datetime}
+                    ).to_dict()
+                    
+        except Exception as e:
+            print(f"[scheduling] Booking extraction failed: {e}")
+    
+    # Generate response for collecting more info
     system_prompt = f"""You are the scheduling assistant for {business_name}.
 {f'The customer is {customer_name}.' if customer_name else ''}
 
@@ -427,76 +842,20 @@ GUIDELINES:
         user=message,
     )
     
-    # Check if we have enough info to book
-    if intent_info.get("has_datetime") and intent_info.get("has_service"):
-        # Try to parse and book
-        booking_check = await app.ai(
-            system=f"""Based on this conversation, do we have enough info to book?
-Required: service type, date/time, customer name (optional but nice to have)
-
-Respond with JSON:
-{{
-  "can_book": true/false,
-  "service": "extracted service or null",
-  "datetime": "YYYY-MM-DD HH:MM format or null",
-  "customer_name": "name if mentioned or null",
-  "missing": ["list of missing info"]
-}}
-
-Current date: {datetime.now().strftime('%Y-%m-%d')}
-Business hours: {hours}""",
-            user=f"Customer said: {message}\nConversation: {conversation_history[-500:] if conversation_history else ''}",
-        )
-        
-        try:
-            check_text = str(booking_check).strip()
-            if "```" in check_text:
-                check_text = check_text.split("```")[1]
-                if check_text.startswith("json"):
-                    check_text = check_text[4:]
-            
-            start = check_text.find("{")
-            end = check_text.rfind("}") + 1
-            if start >= 0 and end > start:
-                booking_info = json.loads(check_text[start:end])
-                
-                if booking_info.get("can_book") and booking_info.get("service") and booking_info.get("datetime"):
-                    # Actually create the appointment!
-                    appt = create_appointment(
-                        business_id=business_id,
-                        customer_phone=phone,
-                        service=booking_info["service"],
-                        datetime_str=booking_info["datetime"],
-                        customer_name=booking_info.get("customer_name") or customer_name,
-                    )
-                    
-                    # Update customer memory with booking preferences
-                    try:
-                        # Extract day/time preferences
-                        dt = datetime.strptime(booking_info["datetime"], "%Y-%m-%d %H:%M")
-                        update_customer_memory(business_id, phone, {
-                            "name": booking_info.get("customer_name") or customer_name,
-                            "preferences": {
-                                "usual_service": booking_info["service"],
-                                "preferred_day": dt.strftime("%A"),
-                                "preferred_time": dt.strftime("%I:%M %p").lstrip("0"),
-                            },
-                            "new_service": f"Booked {booking_info['service']}"
-                        })
-                    except Exception as e:
-                        print(f"[scheduling] Memory update failed: {e}")
-                    
-                    name_greeting = f"{customer_name or booking_info.get('customer_name', '')}, you're".strip(", ")
-                    if not name_greeting.startswith("you're"):
-                        name_greeting = name_greeting.capitalize()
-                    else:
-                        name_greeting = "You're"
-                    
-                    return {"reply": f"Booked! {name_greeting} all set for {format_appointment(appt)}. See you then! ✅"}
-        except Exception as e:
-            print(f"[scheduling] Booking extraction failed: {e}")
+    # Determine what info is missing
+    missing = []
+    if not intent_info.get("has_service"):
+        missing.append("service")
+    if not intent_info.get("has_datetime"):
+        missing.append("datetime")
     
-    return {"reply": str(response)}
+    return SchedulingResult(
+        action=SchedulingAction.COLLECT_INFO.value,
+        status=SchedulingStatus.NEED_MORE_INFO.value,
+        reply=str(response),
+        next_prompt=missing[0] if missing else "confirmation",
+        data={"missing_info": missing}
+    ).to_dict()
 
 
 # ============== Skills for other agents ==============

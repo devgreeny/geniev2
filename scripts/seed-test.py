@@ -87,13 +87,14 @@ def main():
                 VALUES (?, ?, ?, ?, ?, ?, 1, ?)
             """, (rule["id"], business_id, rule["name"], rule["service_type"], rule["days"], rule["template"], rule["priority"]))
         
-        # Add some test customers at different stages
+        # Add some test customers at different stages for retention campaigns
         customers = [
+            # 30-day win-back candidates
             {
                 "id": str(uuid4()),
                 "phone": "+15551234567",
                 "name": "John Smith",
-                "last_service_date": (datetime.now() - timedelta(days=35)).strftime("%Y-%m-%d"),  # Due for haircut
+                "last_service_date": (datetime.now() - timedelta(days=35)).strftime("%Y-%m-%d"),  # 30-45 day window
                 "last_service_type": "haircut",
                 "total_visits": 5
             },
@@ -101,10 +102,28 @@ def main():
                 "id": str(uuid4()),
                 "phone": "+15559876543",
                 "name": "Mike Johnson",
-                "last_service_date": (datetime.now() - timedelta(days=25)).strftime("%Y-%m-%d"),  # Due for fade
+                "last_service_date": (datetime.now() - timedelta(days=32)).strftime("%Y-%m-%d"),  # 30-45 day window
                 "last_service_type": "fade",
                 "total_visits": 12
             },
+            # 60-day win-back candidates
+            {
+                "id": str(uuid4()),
+                "phone": "+15556667777",
+                "name": "Chris Brown",
+                "last_service_date": (datetime.now() - timedelta(days=65)).strftime("%Y-%m-%d"),  # 60-90 day window
+                "last_service_type": "beard trim",
+                "total_visits": 2
+            },
+            {
+                "id": str(uuid4()),
+                "phone": "+15558889999",
+                "name": "Tom Davis",
+                "last_service_date": (datetime.now() - timedelta(days=75)).strftime("%Y-%m-%d"),  # 60-90 day window
+                "last_service_type": "haircut",
+                "total_visits": 8
+            },
+            # Recent customer (should NOT get win-back)
             {
                 "id": str(uuid4()),
                 "phone": "+15555555555",
@@ -113,29 +132,93 @@ def main():
                 "last_service_type": "haircut",
                 "total_visits": 3
             },
+            # Opted-out customer (should be skipped)
             {
                 "id": str(uuid4()),
-                "phone": "+15556667777",
-                "name": "Chris Brown",
-                "last_service_date": (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d"),  # Way overdue
-                "last_service_type": "beard trim",
-                "total_visits": 2
-            },
-            {
-                "id": str(uuid4()),
-                "phone": "+15558889999",
-                "name": None,  # Name unknown
+                "phone": "+15552223333",
+                "name": "Opted Out Guy",
                 "last_service_date": (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d"),
                 "last_service_type": "haircut",
-                "total_visits": 1
+                "total_visits": 1,
+                "opted_out": True
             }
         ]
         
         for cust in customers:
+            opted_out = cust.get("opted_out", False)
             conn.execute("""
                 INSERT INTO customers (id, business_id, phone, name, last_service_date, last_service_type, total_visits, opted_out)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-            """, (cust["id"], business_id, cust["phone"], cust["name"], cust["last_service_date"], cust["last_service_type"], cust["total_visits"]))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (cust["id"], business_id, cust["phone"], cust["name"], cust["last_service_date"], cust["last_service_type"], cust["total_visits"], 1 if opted_out else 0))
+        
+        # Add test appointments for no-show and post-visit campaigns
+        appointments = [
+            # No-show: appointment was 2 hours ago, still 'confirmed'
+            {
+                "id": str(uuid4()),
+                "customer_phone": "+15553334444",
+                "customer_name": "No Show Nancy",
+                "service": "haircut",
+                "datetime": (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "confirmed"  # Should have been 'completed' but wasn't marked
+            },
+            # No-show: appointment was 5 hours ago, still 'pending'
+            {
+                "id": str(uuid4()),
+                "customer_phone": "+15554445555",
+                "customer_name": "Missing Mike",
+                "service": "fade",
+                "datetime": (datetime.now() - timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "pending"
+            },
+            # Completed recently (for post-visit rebook)
+            {
+                "id": str(uuid4()),
+                "customer_phone": "+15555556666",
+                "customer_name": "Just Finished Jake",
+                "service": "haircut",
+                "datetime": (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "completed"
+            },
+            # Completed a bit ago (for post-visit rebook)
+            {
+                "id": str(uuid4()),
+                "customer_phone": "+15556667788",
+                "customer_name": "Done Earlier Dan",
+                "service": "beard trim",
+                "datetime": (datetime.now() - timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "completed"
+            },
+            # Future appointment (should be ignored)
+            {
+                "id": str(uuid4()),
+                "customer_phone": "+15557778888",
+                "customer_name": "Future Fred",
+                "service": "haircut",
+                "datetime": (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "confirmed"
+            }
+        ]
+        
+        for appt in appointments:
+            conn.execute("""
+                INSERT INTO appointments (id, business_id, customer_phone, customer_name, service, datetime, duration, status)
+                VALUES (?, ?, ?, ?, ?, ?, 60, ?)
+            """, (appt["id"], business_id, appt["customer_phone"], appt["customer_name"], appt["service"], appt["datetime"], appt["status"]))
+        
+        # Create customer records for the appointment customers too
+        appt_customers = [
+            (str(uuid4()), "+15553334444", "No Show Nancy"),
+            (str(uuid4()), "+15554445555", "Missing Mike"),
+            (str(uuid4()), "+15555556666", "Just Finished Jake"),
+            (str(uuid4()), "+15556667788", "Done Earlier Dan"),
+            (str(uuid4()), "+15557778888", "Future Fred"),
+        ]
+        for cust_id, phone, name in appt_customers:
+            conn.execute("""
+                INSERT OR IGNORE INTO customers (id, business_id, phone, name, total_visits, opted_out)
+                VALUES (?, ?, ?, ?, 1, 0)
+            """, (cust_id, business_id, phone, name))
         
         conn.commit()
     
@@ -149,17 +232,33 @@ def main():
         svc = rule['service_type'] or 'all services'
         print(f"   • {rule['name']}: {rule['days']} days ({svc})")
     print()
-    print("👥 Test Customers:")
+    print("👥 Test Customers (for Win-Back campaigns):")
     for cust in customers:
         name = cust['name'] or 'Unknown'
+        if cust.get('opted_out'):
+            print(f"   🚫 {name}: OPTED OUT")
+            continue
         days_ago = (datetime.now() - datetime.strptime(cust['last_service_date'], "%Y-%m-%d")).days
-        status = "✓ Due" if days_ago >= 21 else "○ Recent"
+        if 30 <= days_ago <= 45:
+            status = "📨 30-day win-back"
+        elif 60 <= days_ago <= 90:
+            status = "📨 60-day win-back"
+        else:
+            status = "○ Not in window"
         print(f"   {status} {name}: {cust['last_service_type']} {days_ago} days ago")
     print()
-    print("📱 To test re-engagement:")
-    print("   1. Start the gateway and agents")
-    print("   2. Run: python scripts/reengagement_cron.py --dry-run")
-    print("   3. Or call: POST /sms/reengagement/process {\"dry_run\": true}")
+    print("📅 Test Appointments:")
+    for appt in appointments:
+        print(f"   • {appt['customer_name']}: {appt['status']} ({appt['service']})")
+    print()
+    print("🎯 To test Retention Engine v1:")
+    print("   python scripts/retention_cron.py --dry-run")
+    print()
+    print("   Campaigns that should trigger:")
+    print("   • NO-SHOW RESCUE: No Show Nancy, Missing Mike")
+    print("   • WIN-BACK 30: John Smith, Mike Johnson")
+    print("   • WIN-BACK 60: Chris Brown, Tom Davis")
+    print("   • POST-VISIT REBOOK: Just Finished Jake, Done Earlier Dan")
     print()
     print("💬 Text +12818247889 to test customer service!")
 

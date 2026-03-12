@@ -6,6 +6,7 @@ export interface ExecuteInput {
   message: string;
   business_id: string;
   is_owner: boolean;
+  conversation_history?: string;
 }
 
 export interface ExecuteResponse {

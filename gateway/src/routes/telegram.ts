@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { executeAgent } from '../services/agentfield.js';
 import { sendTelegramMessage } from '../services/telegram.js';
-import { saveMessage, getDb } from '../services/db.js';
+import { saveMessage, getDb, isAiPaused } from '../services/db.js';
 
 const router = Router();
 
@@ -70,7 +70,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
   console.log(`[telegram] Message from ${username} (${userId}): ${text}`);
 
   // Determine if owner or customer based on Telegram ID
-  const isOwner = OWNER_TELEGRAM_ID && userId.toString() === OWNER_TELEGRAM_ID;
+  const isOwner = !!(OWNER_TELEGRAM_ID && userId.toString() === OWNER_TELEGRAM_ID);
   const role = isOwner ? 'owner' : 'customer';
 
   // Save inbound message

@@ -53,9 +53,43 @@ class Appointment:
     service: str
     datetime: str
     duration: int  # minutes
-    status: str  # 'pending' | 'confirmed' | 'completed' | 'cancelled'
+    status: str  # 'pending' | 'confirmed' | 'completed' | 'cancelled' | 'no_show'
     notes: Optional[str]
     created_at: str
+
+
+@dataclass
+class CampaignRun:
+    """Track a retention campaign execution."""
+    id: str
+    business_id: str
+    campaign_type: str  # 'no_show_rescue', 'win_back_30', 'win_back_60', 'post_visit_rebook'
+    started_at: str
+    completed_at: Optional[str]
+    customers_targeted: int
+    messages_sent: int
+    messages_failed: int
+    skipped_opted_out: int
+    skipped_already_booked: int
+    skipped_already_contacted: int
+    status: str  # 'running', 'completed', 'failed'
+
+
+@dataclass
+class CampaignMessage:
+    """Track individual campaign message."""
+    id: str
+    campaign_run_id: str
+    business_id: str
+    customer_phone: str
+    customer_name: Optional[str]
+    campaign_type: str
+    trigger_reason: Optional[str]
+    message_sent: str
+    sent_at: str
+    response_received: bool
+    booked_after: bool
+    stop_reason: Optional[str]  # None, 'replied', 'booked', 'opted_out'
 
 
 @dataclass 
@@ -83,6 +117,9 @@ class Customer:
     total_visits: int
     notes: Optional[str]
     opted_out: bool
+    segment: str  # 'vip', 'at_risk', 'new', 'regular'
+    lifetime_value: float
+    avg_visit_interval: Optional[int]  # Average days between visits
     created_at: str
     updated_at: str
 
