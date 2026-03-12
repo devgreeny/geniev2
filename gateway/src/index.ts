@@ -11,10 +11,8 @@ dotenv.config({ path: envPath });
 import express from 'express';
 import { initDb } from './services/db.js';
 import { initTelegram } from './services/telegram.js';
-import { initVonage } from './services/vonage.js';
 import telegramRouter from './routes/telegram.js';
 import dashboardRouter from './routes/dashboard.js';
-import vonageRouter from './routes/vonage.js';
 
 const app = express();
 const PORT = process.env.PORT ?? 3000;
@@ -39,7 +37,6 @@ app.get('/health', (_req, res) => {
 });
 
 app.use('/telegram', telegramRouter);
-app.use('/vonage', vonageRouter);
 app.use('/api', dashboardRouter);
 
 function start(): void {
@@ -51,11 +48,6 @@ function start(): void {
   }
 
   initTelegram();
-  
-  const vonageConfigured = initVonage();
-  if (vonageConfigured) {
-    console.log('[gateway] Vonage SMS transport ready');
-  }
   
   app.listen(PORT, () => {
     console.log(`[gateway] Gateway running on port ${PORT}`);
